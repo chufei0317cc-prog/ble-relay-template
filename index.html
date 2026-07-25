@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BLE 中继测试</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; max-width: 500px; margin: 0 auto; }
+        button { display: block; width: 100%; padding: 15px; margin: 10px 0; font-size: 18px; }
+        input { width: 100%; padding: 10px; margin: 5px 0; box-sizing: border-box; }
+        .log { background: #f0f0f0; padding: 10px; height: 200px; overflow-y: scroll; font-size: 12px; white-space: pre-wrap; }
+        .status { padding: 10px; margin: 5px 0; border-radius: 5px; }
+        .ok { background: #d4edda; color: #155724; }
+        .err { background: #f8d7da; color: #721c24; }
+    </style>
+</head>
+<body>
+    <h2>BLE 中继测试</h2>
+    
+    <label>MCP地址：</label>
+    <input id="mcpUrl" placeholder="https://xxx.up.railway.app" value="">
+    
+    <label>密钥：</label>
+    <input id="secret" placeholder="你设的BRIDGE_SECRET" value="">
+    
+    <button id="connectMcp">1. 连接服务器</button>
+    <div id="mcpStatus" class="status">未连接</div>
+    
+    <button id="scanBle">2. 扫描蓝牙设备</button>
+    <div id="bleStatus" class="status">未连接</div>
+    
+    <button id="testCmd">3. 发送测试指令</button>
+    <button id="stopCmd">4. 停止</button>
+    
+    <div class="log" id="log">日志将显示在这里...</div>
+
+    <script>
+        let mcpConnected = false;
+        let bleDevice = null;
+        let bleCharacteristic = null;
+        let pollInterval = null;
+        let keepaliveInterval = null;
+        let currentCommand = null;
+
+        const log = (msg) => {
+            const el = document.getElementById('log');
+            el.textContent += new Date().toLocaleTimeString() + ' ' + msg + '\n';
+            el.scrollTop = el.scrollHeight;
+        };
+
+        document.getElementById('connectMcp').onclick = async () => {
+            const url = document.getElementById('mcpUrl').value.trim();
+            const secret = document.getElementById('secret').value.trim();
+            if (!url || !secret) { alert('请填地址和密钥'); return; }
+            try {
+                const resp = await fetch(url + '/toy-next', {
+                    headers: { 'Authorization': secret }
+                });
+                if (resp.ok) {
+                    mcpConnected = true;
+                    document.getElementById('mcpStatus').textContent = '✅ 已连接';
+                    document.getElementById('mcpStatus').className = 'status ok';
+                    log('✅ 服务器连接成功');
+                    startPolling();
+                } else {
+                    throw new Error('HTTP ' + resp.status);
+                }
+            } catch(e) {
+                document.getElementById('mcpStatus').textContent = '❌ 连接失败: ' + e.message;
+                document.getElementById('mcpStatus').className = 'status err';
+                log('❌ 连接失败: ' + e.message);
+            }
+        };
+
+        document.getElementById('scanBle').onclick = async () => {
+            try {
+                if (!navigator.bluetooth) { alert('此浏览器不支持Web Bluetooth'); return; }
+                const device = await navigator.bluetooth.requestDevice({
+                    filters: [{ namePrefix: '' }],
+                    optionalServices: ['generic_access']
+                });
+                bleDevice = device;
+                const server = await device.gatt.connect();
+                log('🔵 已连接: ' + device.name);
+                document.getElementById('bleStatus').textContent = '✅ 已连接: ' + device.name;
+                document.getElementById('bleStatus').className = 'status ok';
+                
+                // 自动查找可写的特征
+                const services = await server.getPrimaryServices();
+                for (let s of services) {
+                    const chars = await s.getCharacteristics();
+                    for (let c of chars) {
+                        if (c.properties.write || c.properties.writeWithoutResponse) {
+                            bleCharacteristic = c;
+                            log('📝 找到可写特征: ' + c.uuid);
+                            break;
+                        }
+                    }
+                    if (bleCharacteristic) break;
+                }
+                if (!bleCharacteristic) {
+                    log('⚠️ 未找到可写特征，请手动在nRF Connect里确认');
+                }
+            } catch(e) {
+                document.getElementById('bleStatus').textContent = '❌ 连接失败: ' + e.message;
+                document.getElementById('bleStatus').className = 'status err';
+                log('❌ 蓝牙连接失败: ' + e.message);
+            }
+        };
+
+        async function sendBle(data) {
+            if (!bleCharacteristic) { log('⚠️ 未连接蓝牙'); return; }
+            try {
+                await bleCharacteristic.writeValue(data);
+                log('📤 发送: ' + Array.from(data).map(b => b.toString(16).padStart(2,'0')).join(' '));
+            } catch(e) {
+                log('❌ 发送失败: ' + e.message);
+            }
+        }
+
+        document.getElementById('testCmd').onclick = () => {
+            if (!bleCharacteristic) { alert('请先连接蓝牙'); return; }
+            // 发送一个通用的测试指令：0x01 0x02 0x03 0x04（不同设备含义不同，需要你根据设备调整）
+            const cmd = new Uint8Array([0x01, 0x02, 0x03, 0x04]);
+            sendBle(cmd);
+            // 启动续命（每1.5秒重发一次）
+            if (keepaliveInterval) clearInterval(keepaliveInterval);
+            keepaliveInterval = setInterval(() => {
+                sendBle(cmd);
+            }, 1500);
+        };
+
+        document.getElementById('stopCmd').onclick = () => {
+            if (keepaliveInterval) { clearInterval(keepaliveInterval); keepaliveInterval = null; }
+            if (bleCharacteristic) {
+                const stop = new Uint8Array([0x00, 0x00, 0x00, 0x00]);
+                sendBle(stop);
+            }
+            log('⏹️ 已停止');
+        };
+
+        function startPolling() {
+            if (pollInterval) clearInterval(pollInterval);
+            pollInterval = setInterval(async () => {
+                if (!mcpConnected) return;
+                try {
+                    const url = document.getElementById('mcpUrl').value.trim();
+                    const secret = document.getElementById('secret').value.trim();
+                    const resp = await fetch(url + '/toy-next', {
+                        headers: { 'Authorization': secret }
+                    });
+                    const data = await resp.json();
+                    if (data && data.command) {
+                        log('📨 收到指令: ' + JSON.stringify(data.command));
+                        // 这里可以扩展解析指令并控制设备
+                    }
+                } catch(e) {
+                    // 静默忽略轮询错误
+                }
+            }, 300);
+        }
+
+        log('🔧 页面已加载，请按顺序操作');
+    </script>
+</body>
+</html>
